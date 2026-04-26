@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,6 +34,10 @@ type config struct {
 	DownloadTimeout     time.Duration
 	HTTPClientTimeout   time.Duration
 	SearchCacheTTL      time.Duration
+	GitHubOwner         string
+	GitHubRepo          string
+	GitHubBranch        string
+	GitHubPAT           string
 }
 
 type server struct {
@@ -124,6 +130,7 @@ type downloadResponse struct {
 	FileDone  bool   `json:"file_done"`
 	LyricDone bool   `json:"lyric_done"`
 	Message   string `json:"message,omitempty"`
+	GitLink   string `json:"gitLink,omitempty"`
 }
 
 type errorResponse struct {
@@ -177,6 +184,10 @@ func loadConfig() (config, error) {
 		DownloadTimeout:     getenvDuration("DOWNLOAD_TIMEOUT", 60*time.Minute),
 		HTTPClientTimeout:   getenvDuration("HTTP_TIMEOUT", 20*time.Second),
 		SearchCacheTTL:      getenvDuration("SEARCH_CACHE_TTL", 10*time.Second),
+		GitHubOwner:         getenvDefault("GITHUB_OWNER", "dumbowl22"),
+		GitHubRepo:          getenvDefault("GITHUB_REPO", "ir-downloader"),
+		GitHubBranch:        getenvDefault("GITHUB_BRANCH", "main"),
+		GitHubPAT:           strings.TrimSpace(os.Getenv("GITHUB_PAT")),
 	}
 
 	if cfg.SpotifyClientID == "" || cfg.SpotifyClientSecret == "" {
@@ -544,11 +555,92 @@ func (s *server) downloadWithSpotiFLAC(parent context.Context, req downloadReque
 	log.Printf("spotiflac exec success spotify_url=%s duration=%s file_done=true lyric_done=%v",
 		choice.SpotifyURL, elapsed, lyricDone)
 
+	// Determine local audio file path
+	audioPath := extractAudioFilePath(stdout.String())
+
+	if audioPath == "" {
+		log.Printf("Could not extract audio file path from spotiflac output, attempting fallback search in %s", outputDir)
+		var foundFile string
+		sanitizedTrack := sanitizePath(choice.Track)
+
+		err := filepath.WalkDir(outputDir, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if !d.IsDir() {
+				ext := strings.ToLower(filepath.Ext(path))
+				if ext == ".flac" || ext == ".mp3" || ext == ".m4a" || ext == ".wav" || ext == ".ogg" {
+					fileName := filepath.Base(path)
+					if strings.Contains(strings.ToLower(fileName), strings.ToLower(sanitizedTrack)) {
+						foundFile = path
+						return filepath.SkipAll
+					}
+				}
+			}
+			return nil
+		})
+
+		if err != nil {
+			log.Printf("Fallback search for audio file failed: %v", err)
+		} else if foundFile != "" {
+			audioPath = foundFile
+			log.Printf("Fallback search found audio file: %s", audioPath)
+		} else {
+			log.Printf("Fallback search found no matching audio files for track %q in %s", choice.Track, outputDir)
+		}
+	}
+
+	var lyricsPath string
+	if audioPath != "" {
+		base := strings.TrimSuffix(audioPath, filepath.Ext(audioPath))
+		possibleLyrics := base + ".lyrics.json"
+		if _, err := os.Stat(possibleLyrics); err == nil {
+			lyricsPath = possibleLyrics
+		}
+	}
+
+	gitLink := ""
+	if audioPath != "" {
+		sanitizedArtist := sanitizePath(choice.Artist)
+		if sanitizedArtist == "" {
+			sanitizedArtist = "Unknown_Artist"
+		}
+		audioFileName := filepath.Base(audioPath)
+		gitHubAudioPath := fmt.Sprintf("downloads/music/%s/%s", sanitizedArtist, audioFileName)
+
+		commitMsg := fmt.Sprintf("Auto-upload: %s - Audio & Lyrics", choice.Track)
+
+		err := uploadToGitHubLFS(ctx, s, audioPath, gitHubAudioPath, commitMsg)
+		if err != nil {
+			log.Printf("GitHub LFS upload failed for audio %s: %v", audioPath, err)
+		} else {
+			gitLink = fmt.Sprintf("https://github.com/%s/%s/blob/%s/%s", s.cfg.GitHubOwner, s.cfg.GitHubRepo, s.cfg.GitHubBranch, gitHubAudioPath)
+			log.Printf("GitHub LFS upload success for audio %s: %s", audioPath, gitLink)
+		}
+
+		if lyricsPath != "" {
+			lyricsFileName := filepath.Base(lyricsPath)
+			gitHubLyricsPath := fmt.Sprintf("downloads/music/%s/%s", sanitizedArtist, lyricsFileName)
+			lyricsBytes, err := os.ReadFile(lyricsPath)
+			if err != nil {
+				log.Printf("Failed to read lyrics file %s: %v", lyricsPath, err)
+			} else {
+				err = uploadToGitHubAPI(ctx, s, lyricsBytes, gitHubLyricsPath, commitMsg)
+				if err != nil {
+					log.Printf("GitHub API upload failed for lyrics %s: %v", lyricsPath, err)
+				} else {
+					log.Printf("GitHub API upload success for lyrics %s", lyricsPath)
+				}
+			}
+		}
+	}
+
 	return downloadResponse{
 		Done:      true,
 		FileDone:  true,
 		LyricDone: lyricDone,
 		Message:   "download complete",
+		GitLink:   gitLink,
 	}, nil
 }
 
@@ -799,4 +891,221 @@ func loggingMiddleware(next http.Handler) http.Handler {
 		log.Printf("http request method=%s path=%s raw_query=%q remote=%s status=%d duration=%s",
 			r.Method, r.URL.Path, r.URL.RawQuery, r.RemoteAddr, rec.status, time.Since(started))
 	})
+}
+
+// GitHub Helper Functions
+
+func sanitizePath(name string) string {
+	// Remove invalid path characters
+	re := regexp.MustCompile(`[<>:"/\\|?*]`)
+	sanitized := re.ReplaceAllString(name, "")
+	return strings.TrimSpace(sanitized)
+}
+
+type lfsBatchRequest struct {
+	Operation string `json:"operation"`
+	Transfers []string `json:"transfers"`
+	Ref struct {
+		Name string `json:"name"`
+	} `json:"ref"`
+	Objects []lfsObject `json:"objects"`
+}
+
+type lfsObject struct {
+	Oid string `json:"oid"`
+	Size int64 `json:"size"`
+}
+
+type lfsBatchResponse struct {
+	Objects []struct {
+		Oid string `json:"oid"`
+		Size int64 `json:"size"`
+		Actions struct {
+			Upload struct {
+				Href string `json:"href"`
+				Header map[string]string `json:"header"`
+				ExpiresIn int `json:"expires_in"`
+			} `json:"upload"`
+		} `json:"actions"`
+		Error *struct {
+			Code int `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	} `json:"objects"`
+}
+
+type gitHubContentRequest struct {
+	Message string `json:"message"`
+	Content string `json:"content"`
+	Branch string `json:"branch,omitempty"`
+	Sha string `json:"sha,omitempty"`
+}
+
+type gitHubContentResponse struct {
+	Sha string `json:"sha"`
+}
+
+func uploadToGitHubLFS(ctx context.Context, s *server, localAudioPath, gitHubPath, commitMsg string) error {
+	file, err := os.Open(localAudioPath)
+	if err != nil {
+		return fmt.Errorf("failed to open local audio file: %w", err)
+	}
+	defer file.Close()
+
+	stat, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to stat local audio file: %w", err)
+	}
+	size := stat.Size()
+
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return fmt.Errorf("failed to hash local audio file: %w", err)
+	}
+	oid := hex.EncodeToString(hash.Sum(nil))
+
+	// Reset file pointer for uploading later
+	if _, err := file.Seek(0, 0); err != nil {
+		return fmt.Errorf("failed to seek file: %w", err)
+	}
+
+	// 1. Make LFS Batch Request
+	batchReq := lfsBatchRequest{
+		Operation: "upload",
+		Transfers: []string{"basic"},
+		Objects: []lfsObject{
+			{Oid: oid, Size: size},
+		},
+	}
+	batchReq.Ref.Name = "refs/heads/" + s.cfg.GitHubBranch
+
+	batchBody, err := json.Marshal(batchReq)
+	if err != nil {
+		return err
+	}
+
+	batchURL := fmt.Sprintf("https://github.com/%s/%s.git/info/lfs/objects/batch", s.cfg.GitHubOwner, s.cfg.GitHubRepo)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, batchURL, bytes.NewReader(batchBody))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/vnd.git-lfs+json")
+	req.Header.Set("Content-Type", "application/vnd.git-lfs+json")
+	req.Header.Set("Authorization", "token "+s.cfg.GitHubPAT)
+
+	res, err := s.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("LFS batch request failed: %w", err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(res.Body)
+		return fmt.Errorf("LFS batch request failed with status %d: %s", res.StatusCode, string(body))
+	}
+
+	var batchResp lfsBatchResponse
+	if err := json.NewDecoder(res.Body).Decode(&batchResp); err != nil {
+		return fmt.Errorf("failed to decode LFS batch response: %w", err)
+	}
+
+	if len(batchResp.Objects) == 0 {
+		return errors.New("no objects returned in LFS batch response")
+	}
+
+	obj := batchResp.Objects[0]
+	if obj.Error != nil {
+		return fmt.Errorf("LFS object error: %s (code %d)", obj.Error.Message, obj.Error.Code)
+	}
+
+	// If there's an upload action, upload the file
+	if obj.Actions.Upload.Href != "" {
+		uploadReq, err := http.NewRequestWithContext(ctx, http.MethodPut, obj.Actions.Upload.Href, file)
+		if err != nil {
+			return fmt.Errorf("failed to create LFS upload request: %w", err)
+		}
+		uploadReq.ContentLength = size
+
+		for k, v := range obj.Actions.Upload.Header {
+			uploadReq.Header.Set(k, v)
+		}
+
+		// Some implementations require content-type, but basic transfer says to send raw binary
+		if uploadReq.Header.Get("Content-Type") == "" {
+			uploadReq.Header.Set("Content-Type", "application/octet-stream")
+		}
+
+		uploadRes, err := s.httpClient.Do(uploadReq)
+		if err != nil {
+			return fmt.Errorf("LFS upload failed: %w", err)
+		}
+		defer uploadRes.Body.Close()
+
+		if uploadRes.StatusCode >= 300 {
+			body, _ := io.ReadAll(uploadRes.Body)
+			return fmt.Errorf("LFS upload failed with status %d: %s", uploadRes.StatusCode, string(body))
+		}
+	}
+
+	// 2. Create LFS Pointer File and commit it via GitHub API
+	pointerFileContent := fmt.Sprintf("version https://git-lfs.github.com/spec/v1\noid sha256:%s\nsize %d\n", oid, size)
+
+	return uploadToGitHubAPI(ctx, s, []byte(pointerFileContent), gitHubPath, commitMsg)
+}
+
+func uploadToGitHubAPI(ctx context.Context, s *server, contentBytes []byte, gitHubPath, commitMsg string) error {
+	encodedContent := base64.StdEncoding.EncodeToString(contentBytes)
+
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/%s", s.cfg.GitHubOwner, s.cfg.GitHubRepo, gitHubPath)
+
+	// Check if file exists to get SHA (for updates)
+	var existingSha string
+	getReq, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL+"?ref="+s.cfg.GitHubBranch, nil)
+	if err == nil {
+		getReq.Header.Set("Authorization", "token "+s.cfg.GitHubPAT)
+		getReq.Header.Set("Accept", "application/vnd.github.v3+json")
+		getRes, err := s.httpClient.Do(getReq)
+		if err == nil && getRes.StatusCode == http.StatusOK {
+			defer getRes.Body.Close()
+			var existing gitHubContentResponse
+			if err := json.NewDecoder(getRes.Body).Decode(&existing); err == nil {
+				existingSha = existing.Sha
+			}
+		} else if getRes != nil {
+			getRes.Body.Close()
+		}
+	}
+
+	reqBody := gitHubContentRequest{
+		Message: commitMsg,
+		Content: encodedContent,
+		Branch:  s.cfg.GitHubBranch,
+		Sha:     existingSha,
+	}
+
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return err
+	}
+
+	putReq, err := http.NewRequestWithContext(ctx, http.MethodPut, apiURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return err
+	}
+	putReq.Header.Set("Authorization", "token "+s.cfg.GitHubPAT)
+	putReq.Header.Set("Accept", "application/vnd.github.v3+json")
+	putReq.Header.Set("Content-Type", "application/json")
+
+	putRes, err := s.httpClient.Do(putReq)
+	if err != nil {
+		return fmt.Errorf("GitHub API PUT failed: %w", err)
+	}
+	defer putRes.Body.Close()
+
+	if putRes.StatusCode != http.StatusCreated && putRes.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(putRes.Body)
+		return fmt.Errorf("GitHub API PUT failed with status %d: %s", putRes.StatusCode, string(respBody))
+	}
+
+	return nil
 }
