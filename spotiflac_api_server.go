@@ -560,19 +560,20 @@ func (s *server) downloadWithSpotiFLAC(parent context.Context, req downloadReque
 
 	if audioPath == "" {
 		log.Printf("Could not extract audio file path from spotiflac output, attempting fallback search in %s", outputDir)
-		var latestFile string
-		var latestTime time.Time
+		var foundFile string
+		sanitizedTrack := sanitizePath(choice.Track)
 
-		err := filepath.Walk(outputDir, func(path string, info os.FileInfo, err error) error {
+		err := filepath.WalkDir(outputDir, func(path string, d os.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}
-			if !info.IsDir() {
+			if !d.IsDir() {
 				ext := strings.ToLower(filepath.Ext(path))
 				if ext == ".flac" || ext == ".mp3" || ext == ".m4a" || ext == ".wav" || ext == ".ogg" {
-					if info.ModTime().After(started) && info.ModTime().After(latestTime) {
-						latestTime = info.ModTime()
-						latestFile = path
+					fileName := filepath.Base(path)
+					if strings.Contains(strings.ToLower(fileName), strings.ToLower(sanitizedTrack)) {
+						foundFile = path
+						return filepath.SkipAll
 					}
 				}
 			}
@@ -581,11 +582,11 @@ func (s *server) downloadWithSpotiFLAC(parent context.Context, req downloadReque
 
 		if err != nil {
 			log.Printf("Fallback search for audio file failed: %v", err)
-		} else if latestFile != "" {
-			audioPath = latestFile
+		} else if foundFile != "" {
+			audioPath = foundFile
 			log.Printf("Fallback search found audio file: %s", audioPath)
 		} else {
-			log.Printf("Fallback search found no recently created audio files in %s", outputDir)
+			log.Printf("Fallback search found no matching audio files for track %q in %s", choice.Track, outputDir)
 		}
 	}
 
