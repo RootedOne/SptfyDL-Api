@@ -557,6 +557,38 @@ func (s *server) downloadWithSpotiFLAC(parent context.Context, req downloadReque
 
 	// Determine local audio file path
 	audioPath := extractAudioFilePath(stdout.String())
+
+	if audioPath == "" {
+		log.Printf("Could not extract audio file path from spotiflac output, attempting fallback search in %s", outputDir)
+		var latestFile string
+		var latestTime time.Time
+
+		err := filepath.Walk(outputDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if !info.IsDir() {
+				ext := strings.ToLower(filepath.Ext(path))
+				if ext == ".flac" || ext == ".mp3" || ext == ".m4a" || ext == ".wav" || ext == ".ogg" {
+					if info.ModTime().After(started) && info.ModTime().After(latestTime) {
+						latestTime = info.ModTime()
+						latestFile = path
+					}
+				}
+			}
+			return nil
+		})
+
+		if err != nil {
+			log.Printf("Fallback search for audio file failed: %v", err)
+		} else if latestFile != "" {
+			audioPath = latestFile
+			log.Printf("Fallback search found audio file: %s", audioPath)
+		} else {
+			log.Printf("Fallback search found no recently created audio files in %s", outputDir)
+		}
+	}
+
 	var lyricsPath string
 	if audioPath != "" {
 		base := strings.TrimSuffix(audioPath, filepath.Ext(audioPath))
@@ -564,8 +596,6 @@ func (s *server) downloadWithSpotiFLAC(parent context.Context, req downloadReque
 		if _, err := os.Stat(possibleLyrics); err == nil {
 			lyricsPath = possibleLyrics
 		}
-	} else {
-		log.Printf("Could not extract audio file path from spotiflac output")
 	}
 
 	gitLink := ""
